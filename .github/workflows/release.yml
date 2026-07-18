@@ -1,0 +1,425 @@
+name: Release
+
+on:
+  push:
+    tags:
+      # GitHub ref filters use glob syntax, not regular expressions. Semantic
+      # validation below remains the authoritative X.Y.Z gate.
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Semantic version to validate without publishing
+        required: true
+        default: 1.3.0
+        type: string
+
+permissions:
+  actions: write
+  contents: write
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Sign, notarize, and publish
+    runs-on: macos-26
+    timeout-minutes: 90
+    environment: release
+    env:
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      CERTIFICATE_P12: ${{ secrets.DEVELOPER_ID_P12 }}
+      CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_PASSWORD }}
+      SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Prepare release metadata
+        shell: bash
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            version="${{ inputs.version }}"
+            tag="v$version"
+          else
+            tag="$GITHUB_REF_NAME"
+            version="${tag#v}"
+          fi
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release version must use X.Y.Z semantic versioning." >&2
+            exit 1
+          fi
+          echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
+
+      - name: Verify the publication tag
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          object_type=$(git cat-file -t "refs/tags/$RELEASE_TAG")
+          if [[ "$object_type" != "tag" ]]; then
+            echo "Release tags must be annotated; lightweight tags are rejected." >&2
+            exit 1
+          fi
+          tagged_commit=$(git rev-list -n 1 "$RELEASE_TAG")
+          if [[ "$tagged_commit" != "$GITHUB_SHA" ]]; then
+            echo "The workflow checkout does not match $RELEASE_TAG." >&2
+            exit 1
+          fi
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$tagged_commit" refs/remotes/origin/main; then
+            echo "$RELEASE_TAG must point to a commit on main." >&2
+            exit 1
+          fi
+
+      - name: Require all release credentials
+        shell: bash
+        run: |
+          required=(APPLE_ID APPLE_APP_PASSWORD APPLE_TEAM_ID CERTIFICATE_P12 CERTIFICATE_PASSWORD SPARKLE_ED_PRIVATE_KEY)
+          missing=()
+          for variable in "${required[@]}"; do
+            if [[ -z "${!variable:-}" ]]; then missing+=("$variable"); fi
+          done
+          if (( ${#missing[@]} )); then
+            echo "Missing release secrets: ${missing[*]}" >&2
+            exit 1
+          fi
+
+      - name: Verify the Sparkle signing key pair
+        shell: bash
+        run: |
+          umask 077
+          seed="$RUNNER_TEMP/sparkle-ed25519.seed"
+          private_key="$RUNNER_TEMP/sparkle-ed25519.der"
+          trap 'rm -f "$seed" "$private_key"' EXIT
+          printf '%s' "$SPARKLE_ED_PRIVATE_KEY" | base64 --decode > "$seed"
+          seed_bytes=$(wc -c < "$seed" | tr -d ' ')
+          if [[ "$seed_bytes" != 32 ]]; then
+            echo "SPARKLE_ED_PRIVATE_KEY must be a base64-encoded 32-byte Ed25519 seed." >&2
+            exit 1
+          fi
+          (printf '302e020100300506032b657004220420' | xxd -r -p; dd if="$seed" bs=32 2>/dev/null) > "$private_key"
+          derived_public_key=$(openssl pkey -inform DER -in "$private_key" -pubout -outform DER | tail -c 32 | base64 | tr -d '\n')
+          embedded_public_key=$(plutil -extract SUPublicEDKey raw TableToolX/Resources/Info.plist)
+          if [[ "$derived_public_key" != "$embedded_public_key" ]]; then
+            echo "The Sparkle private key does not match SUPublicEDKey." >&2
+            exit 1
+          fi
+
+      - name: Select Xcode and install XcodeGen
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app
+          brew install xcodegen
+
+      - name: Generate and validate the project
+        shell: bash
+        run: |
+          xcodegen generate
+          settings=$(xcodebuild -project TableToolX.xcodeproj -scheme TableToolX -configuration Release -showBuildSettings)
+          configured_version=$(printf '%s\n' "$settings" | awk -F ' = ' '/^[[:space:]]*MARKETING_VERSION = / { print $2; exit }')
+          bundle_identifier=$(printf '%s\n' "$settings" | awk -F ' = ' '/^[[:space:]]*PRODUCT_BUNDLE_IDENTIFIER = / { print $2; exit }')
+          hardened_runtime=$(printf '%s\n' "$settings" | awk -F ' = ' '/^[[:space:]]*ENABLE_HARDENED_RUNTIME = / { print $2; exit }')
+          [[ "$configured_version" == "$RELEASE_VERSION" ]]
+          [[ "$bundle_identifier" == "com.leanderrj.TableToolX" ]]
+          [[ "$hardened_runtime" == "YES" ]]
+          plutil -lint TableToolX/Resources/Info.plist >/dev/null
+          public_key=$(plutil -extract SUPublicEDKey raw TableToolX/Resources/Info.plist)
+          public_key_bytes=$(printf '%s' "$public_key" | base64 --decode | wc -c | tr -d ' ')
+          [[ "$public_key_bytes" == "32" ]]
+          [[ "$(plutil -extract SUFeedURL raw TableToolX/Resources/Info.plist)" == "https://github.com/leanderrj/TableToolX/releases/latest/download/appcast.xml" ]]
+          [[ "$(plutil -extract SUEnableAutomaticChecks raw TableToolX/Resources/Info.plist)" == "true" ]]
+          [[ "$(plutil -extract SUEnableInstallerLauncherService raw TableToolX/Resources/Info.plist)" == "true" ]]
+          [[ "$(plutil -extract 'com\.apple\.security\.app-sandbox' raw TableToolX/Resources/TableToolX.entitlements)" == "true" ]]
+          [[ "$(plutil -extract 'com\.apple\.security\.network\.client' raw TableToolX/Resources/TableToolX.entitlements)" == "true" ]]
+          plutil -extract 'com\.apple\.security\.temporary-exception\.mach-lookup\.global-name.0' raw TableToolX/Resources/TableToolX.entitlements >/dev/null
+          plutil -extract 'com\.apple\.security\.temporary-exception\.mach-lookup\.global-name.1' raw TableToolX/Resources/TableToolX.entitlements >/dev/null
+
+      - name: Run release tests
+        run: |
+          xcodebuild test \
+            -project TableToolX.xcodeproj \
+            -scheme TableToolX \
+            -configuration Release \
+            -destination 'platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Import the Developer ID certificate
+        shell: bash
+        run: |
+          umask 077
+          keychain="$RUNNER_TEMP/tabletoolx.keychain-db"
+          keychain_password="tabletoolx-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          certificate="$RUNNER_TEMP/developer-id.p12"
+          echo "RELEASE_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          echo "RELEASE_CERTIFICATE=$certificate" >> "$GITHUB_ENV"
+          printf '%s' "$CERTIFICATE_P12" | base64 --decode > "$certificate"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain"
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          security default-keychain -d user -s "$keychain"
+          identities=$(security find-identity -v -p codesigning "$keychain")
+          if [[ "$identities" != *"Developer ID Application:"*"($APPLE_TEAM_ID)"* ]]; then
+            echo "The imported certificate is not a Developer ID Application identity for team $APPLE_TEAM_ID." >&2
+            exit 1
+          fi
+
+      - name: Archive and export the signed app
+        shell: bash
+        run: |
+          export_options="$RUNNER_TEMP/ExportOptions.plist"
+          plutil -create xml1 "$export_options"
+          plutil -insert destination -string export "$export_options"
+          plutil -insert method -string developer-id "$export_options"
+          plutil -insert signingCertificate -string "Developer ID Application" "$export_options"
+          plutil -insert signingStyle -string manual "$export_options"
+          plutil -insert stripSwiftSymbols -bool true "$export_options"
+          plutil -insert teamID -string "$APPLE_TEAM_ID" "$export_options"
+          xcodebuild archive \
+            -project TableToolX.xcodeproj \
+            -scheme TableToolX \
+            -configuration Release \
+            -archivePath "$RUNNER_TEMP/TableToolX.xcarchive" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/SourcePackages" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="Developer ID Application" \
+            ARCHS="arm64 x86_64" \
+            ONLY_ACTIVE_ARCH=NO \
+            MARKETING_VERSION="$RELEASE_VERSION" \
+            CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
+            OTHER_CODE_SIGN_FLAGS="--timestamp"
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/TableToolX.xcarchive" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -exportOptionsPlist "$export_options"
+          app="$RUNNER_TEMP/export/Table Tool X.app"
+          test -d "$app"
+          built_version=$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")
+          built_feed=$(plutil -extract SUFeedURL raw "$app/Contents/Info.plist")
+          [[ "$built_version" == "$RELEASE_VERSION" ]]
+          [[ "$built_feed" == "https://github.com/leanderrj/TableToolX/releases/latest/download/appcast.xml" ]]
+          architectures=$(lipo -archs "$app/Contents/MacOS/Table Tool X")
+          [[ "$architectures" == *arm64* && "$architectures" == *x86_64* ]]
+          codesign --verify --deep --strict --verbose=2 "$app"
+          signed_entitlements="$RUNNER_TEMP/signed-entitlements.plist"
+          codesign -d --entitlements :- "$app" > "$signed_entitlements"
+          [[ "$(plutil -extract 'com\.apple\.security\.app-sandbox' raw "$signed_entitlements")" == "true" ]]
+          [[ "$(plutil -extract 'com\.apple\.security\.network\.client' raw "$signed_entitlements")" == "true" ]]
+          sparkle_installer_service=$(plutil -extract 'com\.apple\.security\.temporary-exception\.mach-lookup\.global-name.0' raw "$signed_entitlements")
+          sparkle_status_service=$(plutil -extract 'com\.apple\.security\.temporary-exception\.mach-lookup\.global-name.1' raw "$signed_entitlements")
+          [[ "$sparkle_installer_service" == "com.leanderrj.TableToolX-spks" ]]
+          [[ "$sparkle_status_service" == "com.leanderrj.TableToolX-spki" ]]
+          echo "APP_PATH=$app" >> "$GITHUB_ENV"
+
+      - name: Notarize and staple the application
+        shell: bash
+        run: |
+          ditto -c -k --keepParent "$APP_PATH" "$RUNNER_TEMP/notarization.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarization.zip" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          xcrun stapler staple "$APP_PATH"
+          xcrun stapler validate "$APP_PATH"
+          spctl --assess --type execute --verbose=2 "$APP_PATH"
+
+      - name: Package ZIP and DMG
+        shell: bash
+        run: |
+          release_dir="$RUNNER_TEMP/release"
+          appcast_dir="$RUNNER_TEMP/appcast"
+          dmg_source="$RUNNER_TEMP/dmg-source"
+          mkdir -p "$release_dir" "$appcast_dir" "$dmg_source"
+          zip="$appcast_dir/TableToolX-$RELEASE_VERSION.zip"
+          dmg="$release_dir/TableToolX-$RELEASE_VERSION.dmg"
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$zip"
+          ditto "$APP_PATH" "$dmg_source/Table Tool X.app"
+          ln -s /Applications "$dmg_source/Applications"
+          hdiutil create -volname "Table Tool X" -srcfolder "$dmg_source" -ov -format UDZO "$dmg"
+          xcrun notarytool submit "$dmg" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+          sha256=$(shasum -a 256 "$zip" | awk '{print $1}')
+          sed \
+            -e "s/__VERSION__/$RELEASE_VERSION/g" \
+            -e "s/__SHA256__/$sha256/g" \
+            .github/homebrew/table-tool-x.rb.in > "$release_dir/table-tool-x.rb"
+          ruby -c "$release_dir/table-tool-x.rb"
+          tap_name="tabletoolx/release-audit-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          tap_path=$(brew --repository "$tap_name")
+          cleanup_tap() { brew untap "$tap_name" >/dev/null 2>&1 || true; }
+          trap cleanup_tap EXIT
+          brew tap-new "$tap_name" >/dev/null
+          mkdir -p "$tap_path/Casks"
+          cp "$release_dir/table-tool-x.rb" "$tap_path/Casks/table-tool-x.rb"
+          brew style --cask "$tap_path/Casks/table-tool-x.rb"
+          brew audit --cask "$tap_name/table-tool-x"
+          echo "RELEASE_DIR=$release_dir" >> "$GITHUB_ENV"
+          echo "APPCAST_DIR=$appcast_dir" >> "$GITHUB_ENV"
+
+      - name: Generate and verify the Sparkle appcast
+        shell: bash
+        run: |
+          archive="$APPCAST_DIR/TableToolX-$RELEASE_VERSION.zip"
+          release_notes="$RUNNER_TEMP/release-notes.md"
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then section="$RELEASE_VERSION"; else section=Unreleased; fi
+          awk -v section="$section" '
+            BEGIN { found = 0; content = 0 }
+            {
+              plain = "## " section
+              bracketed = "## [" section "]"
+              if ($0 == plain || index($0, plain " - ") == 1 || $0 == bracketed || index($0, bracketed " - ") == 1) {
+                found = 1
+                next
+              }
+              if (found && $0 ~ /^## /) { exit }
+              if (found) {
+                print
+                if ($0 ~ /[^[:space:]]/) { content = 1 }
+              }
+            }
+            END { if (!found || !content) exit 1 }
+          ' docs/CHANGELOG.md > "$release_notes"
+          cp "$release_notes" "${archive%.zip}.txt"
+          echo "RELEASE_NOTES_PATH=$release_notes" >> "$GITHUB_ENV"
+          generate_appcast="$RUNNER_TEMP/SourcePackages/artifacts/sparkle/Sparkle/bin/generate_appcast"
+          test -x "$generate_appcast"
+          printf '%s' "$SPARKLE_ED_PRIVATE_KEY" | "$generate_appcast" \
+            --ed-key-file - \
+            --download-url-prefix "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/" \
+            --link "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}" \
+            --embed-release-notes \
+            -o "$APPCAST_DIR/appcast.xml" \
+            "$APPCAST_DIR"
+          grep -q 'sparkle:edSignature=' "$APPCAST_DIR/appcast.xml"
+          cp "$archive" "$RELEASE_DIR/"
+          cp "$APPCAST_DIR/appcast.xml" "$RELEASE_DIR/"
+          (cd "$RELEASE_DIR" && shasum -a 256 TableToolX-* appcast.xml table-tool-x.rb > SHA256SUMS)
+
+      - name: Attest release artifacts
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: ${{ env.RELEASE_DIR }}/*
+
+      - name: Publish the verified GitHub release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            existing_is_draft=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)
+            if [[ "$existing_is_draft" != "true" ]]; then
+              existing_is_immutable=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isImmutable --jq .isImmutable)
+              if [[ "$existing_is_immutable" == "true" ]]; then
+                gh release verify "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY"
+                echo "Release $RELEASE_TAG is already public, immutable, and verified."
+                exit 0
+              fi
+              echo "Release $RELEASE_TAG is already public but is not immutable." >&2
+              exit 1
+            fi
+            gh release upload "$RELEASE_TAG" "$RELEASE_DIR"/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+            gh release edit "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --notes-file "$RELEASE_NOTES_PATH"
+          else
+            gh release create "$RELEASE_TAG" "$RELEASE_DIR"/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Table Tool X $RELEASE_VERSION" \
+              --notes-file "$RELEASE_NOTES_PATH" \
+              --verify-tag \
+              --draft
+          fi
+
+          # Draft assets remain replaceable until publication. Verify GitHub's stored digest
+          # against every local file before the immutable release boundary is crossed.
+          for asset in "$RELEASE_DIR"/*; do
+            asset_name=$(basename "$asset")
+            expected_digest="sha256:$(shasum -a 256 "$asset" | awk '{print $1}')"
+            uploaded_digest=""
+            for _ in {1..10}; do
+              uploaded_digest=$(gh api \
+                -H 'X-GitHub-Api-Version: 2026-03-10' \
+                "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+                --jq ".assets[] | select(.name == \"$asset_name\") | .digest")
+              if [[ "$uploaded_digest" == "$expected_digest" ]]; then break; fi
+              sleep 2
+            done
+            if [[ "$uploaded_digest" != "$expected_digest" ]]; then
+              echo "Uploaded digest mismatch for $asset_name." >&2
+              exit 1
+            fi
+          done
+
+          # This fork retains the original project's tags through v1.2.1. Mark each
+          # continuation release explicitly so Sparkle's stable /releases/latest feed resolves
+          # to the newly published Table Tool X release.
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+
+          release_verified=false
+          for _ in {1..12}; do
+            if gh release verify "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY"; then
+              release_verified=true
+              break
+            fi
+            sleep 5
+          done
+          if [[ "$release_verified" != "true" ]]; then
+            echo "GitHub did not produce a verifiable immutable release attestation." >&2
+            exit 1
+          fi
+          for asset in "$RELEASE_DIR"/*; do
+            gh release verify-asset "$RELEASE_TAG" "$asset" --repo "$GITHUB_REPOSITORY"
+          done
+
+      - name: Dispatch the Homebrew cask update
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run update-cask.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref main \
+            -f tag="$RELEASE_TAG"
+
+      - name: Upload notarized release candidate
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: table-tool-x-${{ env.RELEASE_VERSION }}-notarized-candidate
+          path: ${{ env.RELEASE_DIR }}/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Remove temporary release credentials
+        if: always()
+        shell: bash
+        run: |
+          security default-keychain -d user -s login.keychain-db 2>/dev/null || true
+          security list-keychains -d user -s login.keychain-db 2>/dev/null || true
+          if [[ -n "${RELEASE_KEYCHAIN:-}" && -f "$RELEASE_KEYCHAIN" ]]; then
+            security delete-keychain "$RELEASE_KEYCHAIN" 2>/dev/null || true
+          fi
+          if [[ -n "${RELEASE_CERTIFICATE:-}" && -f "$RELEASE_CERTIFICATE" ]]; then
+            rm -f "$RELEASE_CERTIFICATE"
+          fi

@@ -1,0 +1,40 @@
+name: Feature proposal
+description: Suggest a focused improvement to native delimited-text editing.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: Describe the workflow and why existing behavior is insufficient.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Explain the smallest useful native macOS interaction.
+    validations:
+      required: true
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - CSV or TSV correctness
+        - Editing workflow
+        - Large-file performance
+        - Accessibility
+        - Release or distribution
+        - Future format support
+    validations:
+      required: true
+  - type: checkboxes
+    id: boundaries
+    attributes:
+      label: Project boundaries
+      options:
+        - label: I understand formulas and spreadsheet formatting are outside the project's scope.
+          required: true

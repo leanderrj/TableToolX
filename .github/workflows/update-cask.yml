@@ -1,0 +1,68 @@
+name: Update Homebrew cask
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published stable release tag to audit and install
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  cask:
+    if: ${{ github.event_name == 'workflow_dispatch' || !github.event.release.prerelease }}
+    runs-on: macos-26
+    timeout-minutes: 20
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: main
+      - name: Download the release cask
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern table-tool-x.rb \
+            --dir "$RUNNER_TEMP/cask"
+          mkdir -p Casks
+          cp "$RUNNER_TEMP/cask/table-tool-x.rb" Casks/table-tool-x.rb
+          tap_name="tabletoolx/release-audit-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          tap_path=$(brew --repository "$tap_name")
+          cleanup() { brew untap "$tap_name" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          brew tap-new "$tap_name" >/dev/null
+          mkdir -p "$tap_path/Casks"
+          cp Casks/table-tool-x.rb "$tap_path/Casks/table-tool-x.rb"
+          brew style --cask "$tap_path/Casks/table-tool-x.rb"
+          brew audit --cask --online "$tap_name/table-tool-x"
+      - name: Open the cask update pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          branch="automation/cask-${RELEASE_TAG}"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            echo "$branch already exists; the cask update has already been dispatched."
+            exit 0
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git switch -c "$branch"
+          git add Casks/table-tool-x.rb
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "Update Homebrew cask for $RELEASE_TAG"
+          git push --set-upstream origin "$branch"
+          gh pr create \
+            --base main \
+            --head "$branch" \
+            --title "Update Homebrew cask for $RELEASE_TAG" \
+            --body "Updates the in-repository cask to the signed ZIP and verified SHA-256 published in $RELEASE_TAG."

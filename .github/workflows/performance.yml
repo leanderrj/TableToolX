@@ -1,0 +1,27 @@
+name: Performance
+
+on:
+  workflow_dispatch:
+    inputs:
+      dataset_mb:
+        description: Generated CSV size in MiB
+        required: true
+        default: '100'
+  schedule:
+    - cron: '23 4 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+      - name: Run bounded large-file benchmark
+        env:
+          TABLETOOLX_PERFORMANCE_MB: ${{ inputs.dataset_mb || '100' }}
+        run: swift test --filter PerformanceTests/testLargeFileBudgets

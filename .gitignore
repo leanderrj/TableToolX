@@ -1,3 +1,9 @@
-xcshareddata
-xcuserdata
 .DS_Store
+.build/
+DerivedData/
+build/
+*.xcuserstate
+xcuserdata/
+TableToolX.xcodeproj/
+TableToolX.xcworkspace/
+
